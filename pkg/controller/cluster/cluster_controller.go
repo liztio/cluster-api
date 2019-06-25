@@ -18,10 +18,12 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 	clusterv1 "sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
 	clusterv1alpha1 "sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
@@ -44,6 +46,12 @@ func AddWithActuator(mgr manager.Manager, actuator Actuator) error {
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager, actuator Actuator) reconcile.Reconciler {
 	return &ReconcileCluster{Client: mgr.GetClient(), scheme: mgr.GetScheme(), actuator: actuator}
+}
+
+var removeClusterFinalizerPatch = map[string]interface{}{
+	"metadata": map[string][]string{
+		"$deleteFromPrimitiveList/finalizers": []string{clusterv1.ClusterFinalizer},
+	},
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -92,24 +100,34 @@ func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Resul
 	// If object hasn't been deleted and doesn't have a finalizer, add one
 	// Add a finalizer to newly created objects.
 	if cluster.ObjectMeta.DeletionTimestamp.IsZero() {
-		finalizerCount := len(cluster.Finalizers)
+		finalizers := []string{}
 
 		if !util.Contains(cluster.Finalizers, metav1.FinalizerDeleteDependents) {
-			cluster.Finalizers = append(cluster.ObjectMeta.Finalizers, metav1.FinalizerDeleteDependents)
+			finalizers = append(finalizers, metav1.FinalizerDeleteDependents)
 		}
 
 		if !util.Contains(cluster.Finalizers, clusterv1.ClusterFinalizer) {
-			cluster.Finalizers = append(cluster.ObjectMeta.Finalizers, clusterv1.ClusterFinalizer)
+			finalizers = append(finalizers, clusterv1.ClusterFinalizer)
 		}
 
-		if len(cluster.Finalizers) > finalizerCount {
-			if err := r.Update(context.Background(), cluster); err != nil {
-				klog.Infof("Failed to add finalizer to cluster %q: %v", name, err)
+		if len(finalizers) > 0 {
+			patch, err := makePatch(
+				map[string]interface{}{
+					"metadata": map[string][]string{
+						"finalizers": []string{clusterv1.ClusterFinalizer},
+					},
+				},
+			)
+
+			if err != nil {
+				klog.Infof("Failed to create patch to add finalizer to cluster %q: %v", name, err)
 				return reconcile.Result{}, err
 			}
 
-			// Since adding the finalizer updates the object return to avoid later update issues.
-			return reconcile.Result{Requeue: true}, nil
+			if err := r.Client.Patch(context.Background(), cluster, patch); err != nil {
+				klog.Errorf("Error adding finalizer to cluster object %v; %v", name, err)
+				return reconcile.Result{}, err
+			}
 		}
 
 	}
@@ -126,10 +144,16 @@ func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Resul
 			klog.Errorf("Error deleting cluster object %v; %v", name, err)
 			return reconcile.Result{}, err
 		}
+
+		patch, err := makePatch(removeClusterFinalizerPatch)
+		if err != nil {
+			klog.Errorf("Error creating patch for cluster finalizer %v; %v", name, err)
+			return reconcile.Result{}, err
+		}
+
 		// Remove finalizer on successful deletion.
 		klog.Infof("cluster object %v deletion successful, removing finalizer.", name)
-		cluster.ObjectMeta.Finalizers = util.Filter(cluster.ObjectMeta.Finalizers, clusterv1.ClusterFinalizer)
-		if err := r.Client.Update(context.Background(), cluster); err != nil {
+		if err := r.Client.Patch(context.Background(), cluster, patch); err != nil {
 			klog.Errorf("Error removing finalizer from cluster object %v; %v", name, err)
 			return reconcile.Result{}, err
 		}
@@ -147,4 +171,12 @@ func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+func makePatch(patch interface{}) (client.Patch, error) {
+	patchData, err := json.Marshal(patch)
+	if err != nil {
+		return nil, errors.Wrap(err, "couldn't json-encode patch")
+	}
+	return client.ConstantPatch(types.StrategicMergePatchType, patchData), nil
 }
